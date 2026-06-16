@@ -4,6 +4,7 @@ import numpy as np
 import math
 import time
 import threading
+import random
 
 FRAME_W, FRAME_H = 640, 480
 FOV = 90
@@ -18,6 +19,7 @@ state = {
     'scan_angle': 0,
     'spd': 0.0,
     'target_moved': False,
+    'explosion_frame': 0,
 }
 key_move = {'lat': 0.0, 'lon': 0.0, 'pressed': False}
 
@@ -34,6 +36,43 @@ def gps_to_pixel(d_lat, d_lon, t_lat, t_lon):
     py = int(FRAME_H/2 - (north / dist) * scale)
     return px, py, dist
 
+def draw_sky_background(frame, phase):
+    # Gradient sky background instead of plain black
+    if phase == 'INTERCEPTED':
+        top_color = np.array([0, 40, 0])
+        bot_color = np.array([0, 10, 0])
+    else:
+        top_color = np.array([40, 20, 10])
+        bot_color = np.array([10, 5, 5])
+    for y in range(FRAME_H):
+        t = y / FRAME_H
+        color = top_color * (1-t) + bot_color * t
+        frame[y, :] = color
+    # Horizon grid lines for depth feel
+    for gx in range(0, FRAME_W, 80):
+        cv2.line(frame, (gx, FRAME_H//2), (gx, FRAME_H), (40,40,40), 1)
+    cv2.line(frame, (0, FRAME_H//2), (FRAME_W, FRAME_H//2), (50,50,50), 1)
+    return frame
+
+def draw_explosion(frame, cx, cy, fcount):
+    # Expanding ring blast effect
+    max_r = 140
+    r = int((fcount % 20) / 20 * max_r)
+    alpha_fade = max(0, 1 - (fcount % 20)/20)
+    color1 = (0, int(255*alpha_fade), int(255*alpha_fade))
+    color2 = (0, 100, 255)
+    cv2.circle(frame, (cx, cy), r, color1, 3)
+    cv2.circle(frame, (cx, cy), max(0, r-20), color2, 2)
+    # Burst lines
+    for i in range(12):
+        ang = math.radians(i * 30 + fcount * 5)
+        x1 = int(cx + 20 * math.cos(ang))
+        y1 = int(cy + 20 * math.sin(ang))
+        x2 = int(cx + (r+30) * math.cos(ang))
+        y2 = int(cy + (r+30) * math.sin(ang))
+        cv2.line(frame, (x1,y1), (x2,y2), (0,200,255), 2)
+    return frame
+
 def draw_frame():
     d_lat = state['drone_lat']
     d_lon = state['drone_lon']
@@ -44,12 +83,12 @@ def draw_frame():
     cx, cy = FRAME_W//2, FRAME_H//2
 
     frame = np.zeros((FRAME_H, FRAME_W, 3), dtype=np.uint8)
-    frame[:] = (15, 15, 15)
+    frame = draw_sky_background(frame, phase)
 
     if phase == 'SCANNING':
         state['scan_angle'] = (state['scan_angle'] + 4) % 360
         for r in range(30, 220, 45):
-            cv2.circle(frame, (cx, cy), r, (0, 60, 0), 1)
+            cv2.circle(frame, (cx, cy), r, (0, 90, 0), 1)
         angle = state['scan_angle']
         ex = int(cx + 210 * math.cos(math.radians(angle)))
         ey = int(cy + 210 * math.sin(math.radians(angle)))
@@ -73,6 +112,19 @@ def draw_frame():
     cv2.line(frame, (cx, cy-25), (cx, cy+25), (0,255,0), 1)
     cv2.circle(frame, (cx,cy), 35, (0,255,0), 1)
 
+    # INTERCEPTED — explosion takes over, no target box logic
+    if phase == 'INTERCEPTED':
+        state['explosion_frame'] += 1
+        frame = draw_explosion(frame, cx, cy, state['explosion_frame'])
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (cx-220, cy-150), (cx+220, cy-90), (0,40,0), -1)
+        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+        cv2.putText(frame, "TARGET INTERCEPTED!",
+            (cx-195, cy-110), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0,255,0), 2)
+        cv2.putText(frame, f"Final distance: {dist:.2f}m",
+            (cx-110, FRAME_H-20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200,255,200), 1)
+        return frame
+
     if d_lat != 0 and phase not in ['SCANNING', 'INIT', 'ARMING', 'TAKEOFF']:
         px, py, _ = gps_to_pixel(d_lat, d_lon, t_lat, t_lon)
         in_frame = 0 < px < FRAME_W and 0 < py < FRAME_H
@@ -95,7 +147,6 @@ def draw_frame():
                     (px+dx*box, py+dy*(box-L)), color, 2)
             cv2.circle(frame, (px,py), 4, color, -1)
 
-            # Dotted line — center to target
             for i in range(1, 20):
                 if i % 2 == 0:
                     ddx = int(cx + (px-cx) * i/20)
@@ -111,13 +162,9 @@ def draw_frame():
                 (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,0), 1)
 
         else:
-            # Target out of frame — dotted line to edge + arrow
-            # Clamp target position to frame edge
             dx = px - cx
             dy = py - cy
             angle = math.atan2(dy, dx)
-
-            # Edge point calculate karo
             if abs(dx) > 0 and abs(dy) > 0:
                 scale_x = (FRAME_W//2 - 20) / abs(dx) if dx != 0 else 999
                 scale_y = (FRAME_H//2 - 20) / abs(dy) if dy != 0 else 999
@@ -125,13 +172,10 @@ def draw_frame():
                 edge_x = int(cx + dx * scale_e)
                 edge_y = int(cy + dy * scale_e)
             else:
-                edge_x = cx
-                edge_y = cy
-
+                edge_x, edge_y = cx, cy
             edge_x = max(20, min(FRAME_W-20, edge_x))
             edge_y = max(20, min(FRAME_H-20, edge_y))
 
-            # Dotted line center to edge
             length = int(math.sqrt((edge_x-cx)**2 + (edge_y-cy)**2))
             if length > 0:
                 for i in range(0, length, 12):
@@ -140,17 +184,13 @@ def draw_frame():
                     ddy = int(cy + (edge_y-cy) * t_val)
                     cv2.circle(frame, (ddx, ddy), 2, (0,0,200), -1)
 
-            # Arrow at edge
             cv2.arrowedLine(frame,
                 (int(edge_x - 20*math.cos(angle)), int(edge_y - 20*math.sin(angle))),
-                (edge_x, edge_y),
-                (0, 0, 255), 2, tipLength=0.4)
+                (edge_x, edge_y), (0, 0, 255), 2, tipLength=0.4)
 
-            # Target out label
             cv2.putText(frame, f"TARGET OUT {dist:.0f}m",
                 (cx-100, cy+60), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,0,255), 2)
 
-            # Direction hint
             dirs = []
             if px > FRAME_W: dirs.append("EAST")
             if px < 0:       dirs.append("WEST")
@@ -166,7 +206,6 @@ def draw_frame():
         'CHASING':        (0,80,255),
         'CLOSING':        (0,165,255),
         'INTERCEPT ZONE': (0,255,100),
-        'INTERCEPTED':    (0,255,0),
         'LANDING':        (200,200,0),
     }
     pcol = phase_colors.get(phase, (180,180,180))
@@ -174,16 +213,9 @@ def draw_frame():
         cv2.FONT_HERSHEY_SIMPLEX, 0.65, pcol, 2)
     cv2.putText(frame,
         f"Dist:{dist:.1f}m Spd:{state['spd']:.1f}m/s Step:{state['step']}",
-        (10, FRAME_H-30), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (160,160,160), 1)
+        (10, FRAME_H-30), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200,200,200), 1)
     cv2.putText(frame, "WASD: move target | Q: quit",
-        (10, FRAME_H-12), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (100,100,100), 1)
-
-    if state['intercepted']:
-        overlay = frame.copy()
-        cv2.rectangle(overlay,(cx-210,cy-45),(cx+210,cy+45),(0,60,0),-1)
-        cv2.addWeighted(overlay,0.55,frame,0.45,0,frame)
-        cv2.putText(frame, "TARGET INTERCEPTED!",
-            (cx-170,cy+12), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,0), 2)
+        (10, FRAME_H-12), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (150,150,150), 1)
 
     return frame
 
@@ -271,7 +303,6 @@ def mavlink_thread():
         state['step'] = step
         now = time.time()
 
-        # Key se target move
         if key_move['pressed']:
             t_lat += key_move['lat']
             t_lon += key_move['lon']
@@ -295,32 +326,27 @@ def mavlink_thread():
         spd_m = drone.recv_match(type='VFR_HUD', blocking=False)
         if spd_m: state['spd'] = spd_m.groundspeed
 
-        # Frame check
         px, py, _ = gps_to_pixel(d_lat, d_lon, t_lat, t_lon)
         in_frame = 0 < px < FRAME_W and 0 < py < FRAME_H
 
-        # Out count sirf tab badhao jab target manually move hua ho
         if not in_frame and state['target_moved']:
             out_count += 1
         elif in_frame:
             out_count = 0
             hover_lat = d_lat
             hover_lon = d_lon
-            # RE-SCAN se wapas aao
             if state['phase'] == 'RE-SCANNING':
                 state['phase'] = 'CHASING'
                 state['target_moved'] = False
                 print(f"[PHASE] TARGET REACQUIRED — {d:.0f}m")
                 mp_msg(f"TARGET REACQUIRED {d:.0f}m", mav.mavlink.MAV_SEVERITY_WARNING)
 
-        # RE-SCAN trigger
         if out_count > 10 and state['phase'] != 'RE-SCANNING':
             state['phase'] = 'RE-SCANNING'
             out_count = 0
-            print(f"[PHASE] TARGET LOST — HOVERING at ({hover_lat:.6f},{hover_lon:.6f})")
+            print(f"[PHASE] TARGET LOST — HOVERING")
             mp_msg("TARGET LOST - HOVERING", mav.mavlink.MAV_SEVERITY_WARNING)
 
-        # Phase update
         if state['phase'] != 'RE-SCANNING':
             if d > 50:   state['phase'] = 'CHASING'
             elif d > 15: state['phase'] = 'CLOSING'
@@ -344,8 +370,8 @@ def mavlink_thread():
             last_msg_time = now
 
         if d < 5.0:
-            state['intercepted'] = True
             state['phase'] = 'INTERCEPTED'
+            state['intercepted'] = True
             mp_msg("TARGET INTERCEPTED!!!", mav.mavlink.MAV_SEVERITY_EMERGENCY)
             print("\n" + "="*50)
             print(f"   TARGET INTERCEPTED! Step:{step} Dist:{d:.2f}m")
@@ -365,6 +391,7 @@ def mavlink_thread():
         drone.target_system, drone.target_component,
         mav.mavlink.MAV_CMD_NAV_LAND,
         0,0,0,0,0,0,0,0)
+    time.sleep(2)
     state['phase'] = 'LANDING'
 
 t = threading.Thread(target=mavlink_thread, daemon=True)
@@ -385,22 +412,23 @@ while True:
     elif key == ord('w') or key == 82:
         key_move['lat'] += MOVE_STEP
         key_move['pressed'] = True
-        print("[KEY] W → NORTH")
     elif key == ord('s') or key == 84:
         key_move['lat'] -= MOVE_STEP
         key_move['pressed'] = True
-        print("[KEY] S → SOUTH")
     elif key == ord('a') or key == 81:
         key_move['lon'] -= MOVE_STEP
         key_move['pressed'] = True
-        print("[KEY] A → WEST")
     elif key == ord('d') or key == 83:
         key_move['lon'] += MOVE_STEP
         key_move['pressed'] = True
-        print("[KEY] D → EAST")
 
-    if state['intercepted'] and not t.is_alive():
-        time.sleep(2)
+    if state['intercepted']:
+        # Explosion animation ke liye 2 second extra dikhao
+        for _ in range(60):
+            frame = draw_frame()
+            cv2.imshow("Interceptor Camera View", frame)
+            if cv2.waitKey(33) & 0xFF == ord('q'):
+                break
         break
 
 cv2.destroyAllWindows()
